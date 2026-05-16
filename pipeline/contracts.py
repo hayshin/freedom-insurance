@@ -162,6 +162,7 @@ def build_contract_frame(
     if agg_exprs:
         generic_features = polars_to_pandas(raw.group_by("contract_number", maintain_order=True).agg(agg_exprs))
         generic_features = generic_features.set_index("contract_number").reindex(frame.index)
+        generic_features = generic_features.loc[:, ~generic_features.columns.isin(frame.columns)]
         frame = pd.concat([frame, generic_features], axis=1).copy()
 
     if "claim_amount" in frame:
