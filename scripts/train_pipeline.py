@@ -48,6 +48,15 @@ except ImportError:
     LGBMRegressor = None
     HAS_LIGHTGBM = False
 
+try:
+    from catboost import CatBoostClassifier, CatBoostRegressor
+
+    HAS_CATBOOST = True
+except ImportError:
+    CatBoostClassifier = None
+    CatBoostRegressor = None
+    HAS_CATBOOST = False
+
 
 TARGET_COLUMNS = {"claim_amount", "claim_cnt", "is_claim"}
 RAW_ID_COLUMNS = {"unique_id", "contract_number", "insurer_iin", "driver_iin", "car_number"}
@@ -77,10 +86,12 @@ N_PIPELINE_STAGES = 12
 class PricingCalibration:
     scale: float
     threshold: float
+    floor_ratio: float
     validation_loss_ratio: float
     group_keep_or_decrease_loss_ratio: float | None
     group_increase_loss_ratio: float | None
     keep_or_decrease_share: float
+    group_loss_ratio_gap: float | None
 
 
 def is_categorical_feature(series: pd.Series, column_name: str) -> bool:
@@ -111,13 +122,19 @@ def parse_args() -> argparse.Namespace:
         "--progress-period",
         type=int,
         default=50,
-        help="Print LightGBM training progress every N boosting iterations.",
+        help="Print boosting progress every N iterations.",
     )
     parser.add_argument("--quiet", action="store_true", help="Disable progress messages.")
     parser.add_argument(
+        "--model-backend",
+        choices=["auto", "sklearn", "lightgbm", "catboost"],
+        default="auto",
+        help="Model backend to train. auto prefers CatBoost, then LightGBM, then sklearn.",
+    )
+    parser.add_argument(
         "--force-sklearn",
         action="store_true",
-        help="Use sklearn fallback models even when LightGBM is installed.",
+        help=argparse.SUPPRESS,
     )
     return parser.parse_args()
 
@@ -409,6 +426,36 @@ def make_lgbm_regressor(random_state: int):
     )
 
 
+def make_catboost_classifier(random_state: int, progress_period: int, show_progress: bool):
+    return CatBoostClassifier(
+        loss_function="Logloss",
+        eval_metric="AUC",
+        iterations=900,
+        learning_rate=0.03,
+        depth=6,
+        l2_leaf_reg=6.0,
+        random_seed=random_state,
+        auto_class_weights="Balanced",
+        allow_writing_files=False,
+        thread_count=-1,
+        verbose=max(1, progress_period) if show_progress else False,
+    )
+
+
+def make_catboost_regressor(random_state: int, progress_period: int, show_progress: bool):
+    return CatBoostRegressor(
+        loss_function="RMSE",
+        iterations=700,
+        learning_rate=0.03,
+        depth=6,
+        l2_leaf_reg=6.0,
+        random_seed=random_state,
+        allow_writing_files=False,
+        thread_count=-1,
+        verbose=max(1, progress_period) if show_progress else False,
+    )
+
+
 def make_sklearn_model(model_type: str, numeric: list[str], categorical: list[str], random_state: int) -> Pipeline:
     preprocessor = ColumnTransformer(
         transformers=[
@@ -467,6 +514,37 @@ def prepare_lgbm_frame(frame: pd.DataFrame, categorical: list[str]) -> pd.DataFr
     return prepared
 
 
+def prepare_catboost_frame(frame: pd.DataFrame, categorical: list[str]) -> pd.DataFrame:
+    prepared = frame.copy()
+    for col in categorical:
+        prepared[col] = prepared[col].fillna("__MISSING__").astype(str)
+    missed_categorical = [
+        col for col in prepared.columns if col not in categorical and is_categorical_feature(prepared[col], col)
+    ]
+    if missed_categorical:
+        raise ValueError(
+            "CatBoost input contains string/category columns not declared as categorical: "
+            f"{missed_categorical}"
+        )
+    return prepared
+
+
+def resolve_model_backend(requested_backend: str, force_sklearn: bool) -> str:
+    if force_sklearn:
+        return "sklearn"
+    if requested_backend == "auto":
+        if HAS_CATBOOST:
+            return "catboost"
+        if HAS_LIGHTGBM:
+            return "lightgbm"
+        return "sklearn"
+    if requested_backend == "catboost" and not HAS_CATBOOST:
+        raise ImportError("CatBoost backend requested, but catboost is not installed.")
+    if requested_backend == "lightgbm" and not HAS_LIGHTGBM:
+        raise ImportError("LightGBM backend requested, but lightgbm is not installed.")
+    return requested_backend
+
+
 def train_frequency_model(
     train_x: pd.DataFrame,
     train_y: pd.Series,
@@ -474,11 +552,21 @@ def train_frequency_model(
     categorical: list[str],
     numeric: list[str],
     random_state: int,
-    force_sklearn: bool,
+    backend: str,
     progress_period: int,
     show_progress: bool,
 ):
-    if HAS_LIGHTGBM and not force_sklearn:
+    if backend == "catboost":
+        model = make_catboost_classifier(random_state, progress_period, show_progress)
+        model.fit(
+            prepare_catboost_frame(train_x, categorical),
+            train_y,
+            cat_features=categorical,
+        )
+        valid_pred = model.predict_proba(prepare_catboost_frame(valid_x, categorical))[:, 1]
+        return model, valid_pred, "catboost"
+
+    if backend == "lightgbm":
         model = make_lgbm_classifier(random_state)
         model.fit(
             prepare_lgbm_frame(train_x, categorical),
@@ -509,12 +597,22 @@ def train_severity_model(
     categorical: list[str],
     numeric: list[str],
     random_state: int,
-    force_sklearn: bool,
+    backend: str,
     progress_period: int,
     show_progress: bool,
 ):
     y = np.log1p(train_amount)
-    if HAS_LIGHTGBM and not force_sklearn:
+    if backend == "catboost":
+        model = make_catboost_regressor(random_state, progress_period, show_progress)
+        model.fit(
+            prepare_catboost_frame(train_x, categorical),
+            y,
+            cat_features=categorical,
+        )
+        valid_pred = np.expm1(model.predict(prepare_catboost_frame(valid_x, categorical))).clip(min=0)
+        return model, valid_pred, "catboost"
+
+    if backend == "lightgbm":
         model = make_lgbm_regressor(random_state)
         model.fit(
             prepare_lgbm_frame(train_x, categorical),
@@ -539,13 +637,17 @@ def train_severity_model(
 
 
 def predict_frequency(model, x: pd.DataFrame, categorical: list[str], backend: str) -> np.ndarray:
+    if backend == "catboost":
+        return model.predict_proba(prepare_catboost_frame(x, categorical))[:, 1]
     if backend == "lightgbm":
         return model.predict_proba(prepare_lgbm_frame(x, categorical))[:, 1]
     return model.predict_proba(x)[:, 1]
 
 
 def predict_severity(model, x: pd.DataFrame, categorical: list[str], backend: str) -> np.ndarray:
-    if backend == "lightgbm":
+    if backend == "catboost":
+        pred = model.predict(prepare_catboost_frame(x, categorical))
+    elif backend == "lightgbm":
         pred = model.predict(prepare_lgbm_frame(x, categorical))
     else:
         pred = model.predict(x)
@@ -571,49 +673,62 @@ def portfolio_loss_ratio(claim_amount: pd.Series | np.ndarray, premium: pd.Serie
 def calibrate_pricing(valid: pd.DataFrame, expected_claim: np.ndarray) -> tuple[np.ndarray, PricingCalibration]:
     base_premium = valid["premium"].astype(float).to_numpy()
     actual_claim = valid["claim_amount"].astype(float).to_numpy()
+    risk_ratio = expected_claim / np.maximum(base_premium, 1.0)
 
-    best: tuple[float, float, float, float, float | None, float | None, float] | None = None
-    scales = np.linspace(0.55, 2.50, 80)
-    thresholds = np.quantile(expected_claim / np.maximum(base_premium, 1.0), np.linspace(0.0, 0.90, 31))
+    best: tuple[float, float, float, float, float, float | None, float | None, float, float | None] | None = None
+    scales = np.linspace(0.05, 4.00, 140)
+    floor_ratios = np.array([0.0, 0.15, 0.30, 0.45, 0.60, 0.75, 0.90, 1.0])
+    thresholds = np.unique(np.quantile(risk_ratio, np.linspace(0.0, 0.97, 61)))
 
     for scale in scales:
         raw_new_premium = np.clip((expected_claim / TARGET_LOSS_RATIO) * scale, 0.0, base_premium * 3.0)
-        for threshold in thresholds:
-            risk_ratio = expected_claim / np.maximum(base_premium, 1.0)
-            proposed = np.where(risk_ratio >= threshold, raw_new_premium, np.minimum(raw_new_premium, base_premium))
-            proposed = np.clip(proposed, 0.0, base_premium * 3.0)
-            lr_total = portfolio_loss_ratio(actual_claim, proposed)
-            increased = proposed > base_premium
-            keep_share = float((~increased).mean())
-            lr_keep = portfolio_loss_ratio(actual_claim[~increased], proposed[~increased]) if (~increased).any() else None
-            lr_inc = portfolio_loss_ratio(actual_claim[increased], proposed[increased]) if increased.any() else None
+        for floor_ratio in floor_ratios:
+            minimum_allowed = base_premium * floor_ratio
+            increase_candidate = np.maximum(raw_new_premium, minimum_allowed)
+            keep_candidate = np.maximum(np.minimum(raw_new_premium, base_premium), minimum_allowed)
+            for threshold in thresholds:
+                proposed = np.where(risk_ratio >= threshold, increase_candidate, keep_candidate)
+                proposed = np.clip(proposed, 0.0, base_premium * 3.0)
+                lr_total = portfolio_loss_ratio(actual_claim, proposed)
+                increased = proposed > base_premium
+                keep_share = float((~increased).mean())
+                lr_keep = portfolio_loss_ratio(actual_claim[~increased], proposed[~increased]) if (~increased).any() else None
+                lr_inc = portfolio_loss_ratio(actual_claim[increased], proposed[increased]) if increased.any() else None
 
-            group_penalty = 0.0
-            if lr_keep is not None:
-                group_penalty += abs(lr_keep - TARGET_LOSS_RATIO)
-            if lr_inc is not None:
-                group_penalty += abs(lr_inc - TARGET_LOSS_RATIO)
-            objective = abs(lr_total - TARGET_LOSS_RATIO) + 0.35 * group_penalty - 0.08 * keep_share
+                group_gap = None
+                if lr_keep is not None and lr_inc is not None:
+                    group_gap = abs(lr_keep - TARGET_LOSS_RATIO) + abs(lr_inc - TARGET_LOSS_RATIO)
+                    group_penalty = group_gap
+                else:
+                    group_penalty = 2.0
 
-            if best is None or objective < best[0]:
-                best = (objective, scale, threshold, lr_total, lr_keep, lr_inc, keep_share)
+                total_penalty = abs(lr_total - TARGET_LOSS_RATIO)
+                outside_target_band = max(total_penalty - 0.02, 0.0)
+                objective = 2.0 * total_penalty + 1.20 * group_penalty + 5.0 * outside_target_band - 0.02 * keep_share
+
+                if best is None or objective < best[0]:
+                    best = (objective, scale, threshold, floor_ratio, lr_total, lr_keep, lr_inc, keep_share, group_gap)
 
     if best is None:
         raise RuntimeError("Could not calibrate pricing.")
 
-    _, scale, threshold, lr_total, lr_keep, lr_inc, keep_share = best
-    risk_ratio = expected_claim / np.maximum(base_premium, 1.0)
+    _, scale, threshold, floor_ratio, lr_total, lr_keep, lr_inc, keep_share, group_gap = best
     raw_new_premium = np.clip((expected_claim / TARGET_LOSS_RATIO) * scale, 0.0, base_premium * 3.0)
-    calibrated = np.where(risk_ratio >= threshold, raw_new_premium, np.minimum(raw_new_premium, base_premium))
+    minimum_allowed = base_premium * floor_ratio
+    increase_candidate = np.maximum(raw_new_premium, minimum_allowed)
+    keep_candidate = np.maximum(np.minimum(raw_new_premium, base_premium), minimum_allowed)
+    calibrated = np.where(risk_ratio >= threshold, increase_candidate, keep_candidate)
     calibrated = np.clip(calibrated, 0.0, base_premium * 3.0)
 
     calibration = PricingCalibration(
         scale=float(scale),
         threshold=float(threshold),
+        floor_ratio=float(floor_ratio),
         validation_loss_ratio=float(lr_total),
         group_keep_or_decrease_loss_ratio=None if lr_keep is None else float(lr_keep),
         group_increase_loss_ratio=None if lr_inc is None else float(lr_inc),
         keep_or_decrease_share=float(keep_share),
+        group_loss_ratio_gap=None if group_gap is None else float(group_gap),
     )
     return calibrated, calibration
 
@@ -622,10 +737,13 @@ def apply_pricing(frame: pd.DataFrame, expected_claim: np.ndarray, calibration: 
     base_premium = frame["premium"].astype(float).to_numpy()
     risk_ratio = expected_claim / np.maximum(base_premium, 1.0)
     raw_new_premium = np.clip((expected_claim / TARGET_LOSS_RATIO) * calibration.scale, 0.0, base_premium * 3.0)
+    minimum_allowed = base_premium * calibration.floor_ratio
+    increase_candidate = np.maximum(raw_new_premium, minimum_allowed)
+    keep_candidate = np.maximum(np.minimum(raw_new_premium, base_premium), minimum_allowed)
     proposed = np.where(
         risk_ratio >= calibration.threshold,
-        raw_new_premium,
-        np.minimum(raw_new_premium, base_premium),
+        increase_candidate,
+        keep_candidate,
     )
     return np.clip(proposed, 0.0, base_premium * 3.0)
 
@@ -645,6 +763,27 @@ def evaluate(
     base_premium = valid["premium"].astype(float).to_numpy()
     increased = new_premium > base_premium
     keep_or_decrease = ~increased
+    keep_lr = (
+        portfolio_loss_ratio(
+            actual_claim[keep_or_decrease],
+            new_premium[keep_or_decrease],
+        )
+        if keep_or_decrease.any()
+        else None
+    )
+    increase_lr = (
+        portfolio_loss_ratio(
+            actual_claim[increased],
+            new_premium[increased],
+        )
+        if increased.any()
+        else None
+    )
+    group_loss_ratio_gap = (
+        abs(keep_lr - TARGET_LOSS_RATIO) + abs(increase_lr - TARGET_LOSS_RATIO)
+        if keep_lr is not None and increase_lr is not None
+        else None
+    )
 
     metrics = {
         "frequency": {
@@ -669,18 +808,9 @@ def evaluate(
             "mean_new_premium": float(np.mean(new_premium)),
             "increase_share": float((new_premium > valid["premium"].to_numpy()).mean()),
             "keep_or_decrease_share": float((new_premium <= valid["premium"].to_numpy()).mean()),
-            "keep_or_decrease_loss_ratio": portfolio_loss_ratio(
-                actual_claim[keep_or_decrease],
-                new_premium[keep_or_decrease],
-            )
-            if keep_or_decrease.any()
-            else None,
-            "increase_loss_ratio": portfolio_loss_ratio(
-                actual_claim[increased],
-                new_premium[increased],
-            )
-            if increased.any()
-            else None,
+            "keep_or_decrease_loss_ratio": keep_lr,
+            "increase_loss_ratio": increase_lr,
+            "group_loss_ratio_gap": group_loss_ratio_gap,
             "min_new_to_old_premium_ratio": float(np.min(new_premium / np.maximum(base_premium, 1.0))),
             "max_new_to_old_premium_ratio": float(np.max(new_premium / np.maximum(base_premium, 1.0))),
         },
@@ -702,6 +832,7 @@ def save_pickle(path: Path, obj) -> None:
 def main() -> None:
     args = parse_args()
     show_progress = not args.quiet
+    model_backend = resolve_model_backend(args.model_backend, args.force_sklearn)
     artifacts_dir = Path(args.artifacts_dir)
     submission_path = Path(args.submission)
     artifacts_dir.mkdir(parents=True, exist_ok=True)
@@ -776,7 +907,7 @@ def main() -> None:
         categorical_columns,
         numeric_columns,
         args.random_state,
-        args.force_sklearn,
+        model_backend,
         args.progress_period,
         show_progress,
     )
@@ -797,7 +928,7 @@ def main() -> None:
         categorical_columns,
         numeric_columns,
         args.random_state,
-        args.force_sklearn,
+        model_backend,
         args.progress_period,
         show_progress,
     )
@@ -830,6 +961,8 @@ def main() -> None:
     )
     metrics["frequency"]["best_f1_from_pr_curve"] = best_f1
     metrics["models"] = {
+        "requested_backend": args.model_backend,
+        "resolved_backend": model_backend,
         "frequency_backend": frequency_backend,
         "severity_backend": severity_backend,
         "n_train_contracts": int(len(train_part)),
@@ -883,8 +1016,14 @@ def main() -> None:
             "rare_min_count": args.rare_min_count,
         },
     )
-    (artifacts_dir / "metrics.json").write_text(json.dumps(metrics, ensure_ascii=False, indent=2), encoding="utf-8")
-    log_stage_done(started_at, f"saved models.pkl and metrics.json to {artifacts_dir}", enabled=show_progress)
+    metrics_text = json.dumps(metrics, ensure_ascii=False, indent=2)
+    (artifacts_dir / "metrics.json").write_text(metrics_text, encoding="utf-8")
+    (artifacts_dir / f"metrics_{model_backend}.json").write_text(metrics_text, encoding="utf-8")
+    log_stage_done(
+        started_at,
+        f"saved models.pkl, metrics.json, and metrics_{model_backend}.json to {artifacts_dir}",
+        enabled=show_progress,
+    )
 
     print(json.dumps(metrics, ensure_ascii=False, indent=2))
     print(f"Saved submission: {submission_path}")
