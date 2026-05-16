@@ -6,6 +6,7 @@ import polars as pl
 
 from features.car import add_car_features
 from features.driver import add_driver_features
+from features.engine import add_engine_features
 from features.model_mark import add_model_mark_features
 from features.premium import add_premium_features
 from features.region import add_region_features
@@ -110,6 +111,7 @@ def build_contract_frame(raw: pl.DataFrame, is_train: bool) -> pd.DataFrame:
     add_region_features(raw, frame)
     add_model_mark_features(raw, frame)
     add_car_features(raw, frame)
+    add_engine_features(raw, frame)
     add_driver_features(raw, frame)
     score_features = build_score_features(raw, frame.index)
     if not score_features.empty:

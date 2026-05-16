@@ -22,6 +22,8 @@ PREPROCESSED_SOURCE_COLUMNS = {
     "age_experience_id",
     "age_experience_name",
     "experience_year",
+    "engine_volume",
+    "engine_power",
 }
 LEAKAGE_COLUMNS = TARGET_COLUMNS | RAW_ID_COLUMNS | FINANCIAL_METRIC_ONLY_COLUMNS
 HIGH_CARDINALITY_COLUMNS = {
