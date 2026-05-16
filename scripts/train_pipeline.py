@@ -34,6 +34,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from features.car import add_car_features
+from features.driver import add_driver_features
 from features.model_mark import add_model_mark_features
 from features.premium import add_premium_features
 from features.region import add_region_features
@@ -69,7 +70,16 @@ FINANCIAL_METRIC_ONLY_COLUMNS = {
     "premium_return_ratio",
 }
 DATE_COLUMNS = {"operation_date"}
-PREPROCESSED_SOURCE_COLUMNS = {"mark", "model", "car_age", "car_year"}
+PREPROCESSED_SOURCE_COLUMNS = {
+    "mark",
+    "model",
+    "car_age",
+    "car_year",
+    "bonus_malus",
+    "age_experience_id",
+    "age_experience_name",
+    "experience_year",
+}
 LEAKAGE_COLUMNS = TARGET_COLUMNS | RAW_ID_COLUMNS | FINANCIAL_METRIC_ONLY_COLUMNS
 HIGH_CARDINALITY_COLUMNS = {
     "mark_clean_mode",
@@ -275,6 +285,7 @@ def build_contract_frame(raw: pl.DataFrame, is_train: bool) -> pd.DataFrame:
     add_region_features(raw, frame)
     add_model_mark_features(raw, frame)
     add_car_features(raw, frame)
+    add_driver_features(raw, frame)
     score_features = build_score_features(raw, frame.index)
     if not score_features.empty:
         frame = pd.concat([frame, score_features], axis=1).copy()
