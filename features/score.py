@@ -8,6 +8,8 @@ import polars as pl
 
 
 SCORE_GROUP_RE = re.compile(r"^SCORE_(\d+)_")
+DETAILED_SCORE_GROUPS = {"8"}
+DETAILED_MISSING_RATE_GROUPS: set[str] = set()
 
 
 def score_group(column_name: str) -> str | None:
@@ -15,6 +17,10 @@ def score_group(column_name: str) -> str | None:
     if match is None:
         return None
     return match.group(1)
+
+
+def normalized_score_name(column_name: str) -> str:
+    return column_name.lower()
 
 
 def _to_indexed_pandas(features: pl.DataFrame, index: pd.Index) -> pd.DataFrame:
@@ -51,6 +57,8 @@ def build_score_features(raw: pl.DataFrame, index: pd.Index) -> pd.DataFrame:
 
     group_row_columns: list[pl.Expr] = []
     group_agg_exprs: list[pl.Expr] = []
+    detailed_row_columns: list[pl.Expr] = []
+    detailed_agg_exprs: list[pl.Expr] = []
     for group, cols in sorted(grouped_columns.items(), key=lambda item: int(item[0])):
         group_exprs = [pl.col(col).cast(pl.Float64, strict=False) for col in cols]
         prefix = f"score_g{group}"
@@ -71,6 +79,24 @@ def build_score_features(raw: pl.DataFrame, index: pd.Index) -> pd.DataFrame:
                 pl.col(f"_{prefix}_missing_rate").mean().alias(f"{prefix}_missing_rate_mean"),
             ]
         )
+        if group not in DETAILED_SCORE_GROUPS:
+            continue
+        for col in cols:
+            detail_name = normalized_score_name(col)
+            detail_value_col = f"_{detail_name}"
+            detail_missing_col = f"_{detail_name}_is_missing"
+            detail_expr = pl.col(col).cast(pl.Float64, strict=False)
+            detailed_row_columns.append(detail_expr.alias(detail_value_col))
+            detailed_agg_exprs.extend(
+                [
+                    pl.col(detail_value_col).mean().alias(f"{detail_name}_mean"),
+                    pl.col(detail_value_col).min().alias(f"{detail_name}_min"),
+                    pl.col(detail_value_col).max().alias(f"{detail_name}_max"),
+                ]
+            )
+            if group in DETAILED_MISSING_RATE_GROUPS:
+                detailed_row_columns.append(detail_expr.is_null().cast(pl.Int32).alias(detail_missing_col))
+                detailed_agg_exprs.append(pl.col(detail_missing_col).mean().alias(f"{detail_name}_missing_rate"))
 
     rows = raw.select(
         "contract_number",
@@ -81,6 +107,7 @@ def build_score_features(raw: pl.DataFrame, index: pd.Index) -> pd.DataFrame:
         pl.max_horizontal(score_exprs).alias("_score_row_max"),
         score_row_std.alias("_score_row_std"),
         *group_row_columns,
+        *detailed_row_columns,
     )
     features = rows.group_by("contract_number", maintain_order=True).agg(
         [
@@ -99,6 +126,7 @@ def build_score_features(raw: pl.DataFrame, index: pd.Index) -> pd.DataFrame:
             pl.col("_score_row_std").mean().alias("score_row_std_mean"),
             pl.col("_score_row_std").max().alias("score_row_std_max"),
             *group_agg_exprs,
+            *detailed_agg_exprs,
         ]
     )
     score_features = _to_indexed_pandas(features, index).replace([np.inf, -np.inf], np.nan)
