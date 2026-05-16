@@ -113,6 +113,7 @@ def add_driver_features(raw: pl.DataFrame, frame: pd.DataFrame) -> None:
     )
     features = rows.group_by("contract_number", maintain_order=True).agg(
         [
+            (pl.len() > 1).cast(pl.Int8).alias("has_multiple_drivers"),
             pl.col("_bonus_malus_coef").min().alias("bonus_malus_coef_min"),
             pl.col("_bonus_malus_coef").max().alias("bonus_malus_coef_max"),
             pl.col("_bonus_malus_coef").mean().alias("bonus_malus_coef_mean"),

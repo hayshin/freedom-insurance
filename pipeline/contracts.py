@@ -11,6 +11,7 @@ from features.model_mark import add_model_mark_features
 from features.premium import add_premium_features
 from features.region import add_region_features
 from features.score import build_score_features
+from features.vehicle_type import add_vehicle_type_features
 from pipeline.config import DATE_COLUMNS, LEAKAGE_COLUMNS, PREPROCESSED_SOURCE_COLUMNS
 from pipeline.io import polars_to_pandas
 
@@ -111,6 +112,7 @@ def build_contract_frame(raw: pl.DataFrame, is_train: bool) -> pd.DataFrame:
     add_region_features(raw, frame)
     add_model_mark_features(raw, frame)
     add_car_features(raw, frame)
+    add_vehicle_type_features(raw, frame)
     add_engine_features(raw, frame)
     add_driver_features(raw, frame)
     score_features = build_score_features(raw, frame.index)
