@@ -40,6 +40,8 @@ def evaluate(
     base_premium = valid["premium"].astype(float).to_numpy()
     increased = new_premium > base_premium
     keep_or_decrease = ~increased
+    keep_or_decrease_count = int(keep_or_decrease.sum())
+    increase_count = int(increased.sum())
     keep_lr = (
         portfolio_loss_ratio(
             actual_claim[keep_or_decrease],
@@ -85,6 +87,8 @@ def evaluate(
             "mean_new_premium": float(np.mean(new_premium)),
             "increase_share": float((new_premium > valid["premium"].to_numpy()).mean()),
             "keep_or_decrease_share": float((new_premium <= valid["premium"].to_numpy()).mean()),
+            "keep_or_decrease_count": keep_or_decrease_count,
+            "increase_count": increase_count,
             "keep_or_decrease_loss_ratio": keep_lr,
             "increase_loss_ratio": increase_lr,
             "group_loss_ratio_gap": group_loss_ratio_gap,

@@ -51,3 +51,12 @@ class PricingCalibration:
     group_increase_loss_ratio: float | None
     keep_or_decrease_share: float
     group_loss_ratio_gap: float | None
+
+
+@dataclass
+class SeverityCalibration:
+    intercept: float
+    slope: float
+    positive_count: int
+    raw_rmse_positive: float
+    raw_r2_positive: float

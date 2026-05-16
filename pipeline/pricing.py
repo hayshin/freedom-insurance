@@ -23,7 +23,7 @@ def calibrate_pricing(valid: pd.DataFrame, expected_claim: np.ndarray) -> tuple[
     best: tuple[float, float, float, float, float, float | None, float | None, float, float | None] | None = None
     scales = np.linspace(0.05, 4.00, 140)
     floor_ratios = np.array([0.0, 0.15, 0.30, 0.45, 0.60, 0.75, 0.90, 1.0])
-    thresholds = np.unique(np.quantile(risk_ratio, np.linspace(0.0, 0.97, 61)))
+    thresholds = np.unique(np.quantile(risk_ratio, np.r_[np.linspace(0.0, 0.97, 61), 0.98, 0.99, 0.995]))
 
     for scale in scales:
         raw_new_premium = np.clip((expected_claim / TARGET_LOSS_RATIO) * scale, 0.0, base_premium * 3.0)
@@ -49,7 +49,7 @@ def calibrate_pricing(valid: pd.DataFrame, expected_claim: np.ndarray) -> tuple[
 
                 total_penalty = abs(lr_total - TARGET_LOSS_RATIO)
                 outside_target_band = max(total_penalty - 0.02, 0.0)
-                objective = 2.0 * total_penalty + 1.20 * group_penalty + 5.0 * outside_target_band - 0.02 * keep_share
+                objective = 2.0 * total_penalty + 1.0 * group_penalty + 5.0 * outside_target_band - 0.06 * keep_share
 
                 if best is None or objective < best[0]:
                     best = (objective, scale, threshold, floor_ratio, lr_total, lr_keep, lr_inc, keep_share, group_gap)

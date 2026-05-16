@@ -31,6 +31,46 @@ def parse_args() -> argparse.Namespace:
         default=50,
         help="Print boosting progress every N iterations.",
     )
+    parser.add_argument(
+        "--tune-severity",
+        action="store_true",
+        help="Enable CatBoost severity tuning on the validation split.",
+    )
+    parser.add_argument(
+        "--severity-trials",
+        type=int,
+        default=30,
+        help="Number of random-search trials for CatBoost severity tuning.",
+    )
+    parser.add_argument(
+        "--severity-time-budget",
+        type=int,
+        default=1800,
+        help="Maximum tuning time for severity model, in seconds.",
+    )
+    parser.add_argument(
+        "--severity-objective",
+        choices=["rmse", "rmse_r2"],
+        default="rmse_r2",
+        help="Severity tuning objective. rmse_r2 blends RMSE with R2 on positive claims.",
+    )
+    parser.add_argument(
+        "--severity-r2-weight",
+        type=float,
+        default=100000.0,
+        help="Weight for R2 penalty in rmse_r2 objective.",
+    )
+    parser.add_argument(
+        "--severity-target",
+        choices=["amount", "claim_per_premium"],
+        default="claim_per_premium",
+        help="Severity target. claim_per_premium predicts claim_amount relative to premium.",
+    )
+    parser.add_argument(
+        "--disable-severity-calibration",
+        action="store_true",
+        help="Disable validation-fitted affine calibration of severity predictions.",
+    )
     parser.add_argument("--quiet", action="store_true", help="Disable progress messages.")
     parser.add_argument(
         "--model-backend",

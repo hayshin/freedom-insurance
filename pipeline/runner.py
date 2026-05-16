@@ -11,11 +11,12 @@ from pipeline.contracts import build_contract_frame
 from pipeline.evaluation import best_f1_threshold, evaluate
 from pipeline.features import align_features, apply_rare_categories, build_feature_lists, split_train_valid
 from pipeline.io import frame_len, read_input, save_pickle
-from pipeline.logging import log_stage, log_stage_done
+from pipeline.logging import log_progress, log_stage, log_stage_done
 from pipeline.models import (
     predict_frequency,
     predict_severity,
     resolve_model_backend,
+    tune_catboost_severity,
     train_frequency_model,
     train_severity_model,
 )
@@ -118,17 +119,49 @@ def run_pipeline(args) -> None:
             f"Not enough positive claim rows for severity model: {int(severity_train_mask.sum())}. "
             f"Lower --severity-min-claims if this is expected."
         )
-    severity_model, valid_severity, severity_backend = train_severity_model(
-        train_x.loc[severity_train_mask],
-        train_part.loc[severity_train_mask, "claim_amount"],
-        valid_x,
-        categorical_columns,
-        numeric_columns,
-        args.random_state,
-        model_backend,
-        args.progress_period,
-        show_progress,
-    )
+    tuning_info = None
+    if args.tune_severity and model_backend == "catboost":
+        log_progress(
+            "Starting CatBoost severity tuning.",
+            enabled=show_progress,
+        )
+        severity_model, valid_severity, tuning_info = tune_catboost_severity(
+            train_x.loc[severity_train_mask],
+            train_part.loc[severity_train_mask, "claim_amount"],
+            valid_x,
+            valid_part["claim_amount"],
+            categorical_columns,
+            args.random_state,
+            args.severity_trials,
+            args.severity_time_budget,
+            args.progress_period,
+            show_progress,
+            args.severity_r2_weight,
+            args.severity_objective,
+            args.severity_target,
+            not args.disable_severity_calibration,
+        )
+        severity_backend = "catboost"
+    else:
+        if args.tune_severity and model_backend != "catboost":
+            log_progress(
+                f"Severity tuning skipped because backend is {model_backend}.",
+                enabled=show_progress,
+            )
+        severity_model, valid_severity, severity_backend = train_severity_model(
+            train_x.loc[severity_train_mask],
+            train_part.loc[severity_train_mask, "claim_amount"],
+            valid_x,
+            categorical_columns,
+            numeric_columns,
+            args.random_state,
+            model_backend,
+            args.progress_period,
+            show_progress,
+            args.severity_target,
+            not args.disable_severity_calibration,
+            valid_part["claim_amount"],
+        )
     log_stage_done(
         started_at,
         f"backend={severity_backend}, positive_train={int(severity_train_mask.sum()):,}",
@@ -168,7 +201,11 @@ def run_pipeline(args) -> None:
         "n_features": int(len(train_x.columns)),
         "n_numeric_features": int(len(numeric_columns)),
         "n_categorical_features": int(len(categorical_columns)),
+        "severity_target": args.severity_target,
+        "severity_calibrated": not args.disable_severity_calibration,
     }
+    if tuning_info is not None:
+        metrics["severity_tuning"] = tuning_info
     metrics["pricing_calibration"] = asdict(calibration)
     log_stage_done(
         started_at,
@@ -205,6 +242,8 @@ def run_pipeline(args) -> None:
             "severity_model": severity_model,
             "frequency_backend": frequency_backend,
             "severity_backend": severity_backend,
+            "severity_target": args.severity_target,
+            "severity_calibrated": not args.disable_severity_calibration,
             "feature_columns": list(train_x.columns),
             "numeric_columns": numeric_columns,
             "categorical_columns": categorical_columns,
