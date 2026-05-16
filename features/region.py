@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pandas as pd
+import polars as pl
 
 
 MISSING_REGION = "MISSING"
@@ -93,19 +94,63 @@ def mode_or_missing(series: pd.Series) -> str:
     return str(mode.iloc[0])
 
 
-def add_region_features(raw: pd.DataFrame, frame: pd.DataFrame) -> None:
-    if "contract_number" not in raw or "region_name" not in raw:
+def _to_indexed_pandas(features: pl.DataFrame, index: pd.Index) -> pd.DataFrame:
+    if features.is_empty():
+        return pd.DataFrame(index=index)
+    return pd.DataFrame(features.to_dict(as_series=False)).set_index("contract_number").reindex(index)
+
+
+def _normalize_region_expr(column: str) -> pl.Expr:
+    normalized = pl.col(column).cast(pl.String, strict=False).str.strip_chars()
+    return pl.when(normalized.is_null() | (normalized == "")).then(pl.lit(MISSING_REGION)).otherwise(normalized)
+
+
+def _map_values_expr(source: pl.Expr, mapping: dict[str, str], alias: str) -> pl.Expr:
+    mapped = pl.when(source == MISSING_REGION).then(pl.lit(MISSING_REGION))
+    for key, value in mapping.items():
+        mapped = mapped.when(source == key).then(pl.lit(value))
+    return mapped.otherwise(pl.lit(OTHER_REGION)).alias(alias)
+
+
+def _mode_or_missing_expr(column: str, alias: str) -> pl.Expr:
+    return (
+        pl.col(column)
+        .drop_nulls()
+        .mode()
+        .first()
+        .cast(pl.String)
+        .fill_null(MISSING_REGION)
+        .alias(alias)
+    )
+
+
+def add_region_features(raw: pl.DataFrame, frame: pd.DataFrame) -> None:
+    if "contract_number" not in raw.columns or "region_name" not in raw.columns:
         return
 
-    region = raw[["contract_number", "region_name"]].copy()
-    region["region_name_normalized"] = region["region_name"].map(normalize_region_name)
-    region["region_macro"] = region["region_name_normalized"].map(map_region_macro)
-    region["region_climate"] = region["region_name_normalized"].map(map_region_climate)
+    normalized = _normalize_region_expr("region_name")
+    region = raw.select(
+        [
+            "contract_number",
+            normalized.alias("region_name_normalized"),
+            _map_values_expr(normalized, REGION_MACRO_MAP, "region_macro"),
+            _map_values_expr(normalized, REGION_CLIMATE_MAP, "region_climate"),
+        ]
+    )
 
-    grouped = region.groupby("contract_number", sort=False)
-    frame["region_macro_mode"] = grouped["region_macro"].agg(mode_or_missing)
-    frame["region_macro_nunique"] = grouped["region_macro"].nunique(dropna=True).astype("int32")
-    frame["region_climate_mode"] = grouped["region_climate"].agg(mode_or_missing)
-    frame["region_climate_nunique"] = grouped["region_climate"].nunique(dropna=True).astype("int32")
-    frame["is_multi_region_macro"] = (frame["region_macro_nunique"] > 1).astype("int8")
-    frame["is_multi_region_climate"] = (frame["region_climate_nunique"] > 1).astype("int8")
+    features = region.group_by("contract_number", maintain_order=True).agg(
+        [
+            _mode_or_missing_expr("region_macro", "region_macro_mode"),
+            pl.col("region_macro").drop_nulls().n_unique().cast(pl.Int32).alias("region_macro_nunique"),
+            _mode_or_missing_expr("region_climate", "region_climate_mode"),
+            pl.col("region_climate").drop_nulls().n_unique().cast(pl.Int32).alias("region_climate_nunique"),
+        ]
+    ).with_columns(
+        [
+            (pl.col("region_macro_nunique") > 1).cast(pl.Int8).alias("is_multi_region_macro"),
+            (pl.col("region_climate_nunique") > 1).cast(pl.Int8).alias("is_multi_region_climate"),
+        ]
+    )
+    indexed = _to_indexed_pandas(features, frame.index)
+    for col in indexed.columns:
+        frame[col] = indexed[col]

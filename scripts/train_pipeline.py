@@ -37,7 +37,7 @@ from features.car import add_car_features
 from features.model_mark import add_model_mark_features
 from features.premium import add_premium_features
 from features.region import add_region_features
-from features.score import build_score_features, score_group
+from features.score import build_score_features
 
 try:
     from lightgbm import LGBMClassifier, LGBMRegressor
@@ -113,12 +113,6 @@ def parse_args() -> argparse.Namespace:
         default=50,
         help="Print LightGBM training progress every N boosting iterations.",
     )
-    parser.add_argument(
-        "--aggregation-backend",
-        choices=["polars", "pandas"],
-        default="polars",
-        help="Backend used for contract-level feature aggregation.",
-    )
     parser.add_argument("--quiet", action="store_true", help="Disable progress messages.")
     parser.add_argument(
         "--force-sklearn",
@@ -156,47 +150,16 @@ def make_lgbm_progress_callback(label: str, total_iterations: int, period: int, 
     return _callback
 
 
-def read_csv(path: str | Path, nrows: int | None = None) -> pd.DataFrame:
-    return pd.read_csv(path, low_memory=False, encoding="utf-8-sig", nrows=nrows)
+def read_input(path: str | Path, nrows: int | None) -> pl.DataFrame:
+    return pl.read_csv(path, n_rows=nrows, infer_schema_length=None, encoding="utf8-lossy")
 
 
-def read_input(path: str | Path, nrows: int | None, backend: str) -> pd.DataFrame | pl.DataFrame:
-    if backend == "polars":
-        return pl.read_csv(path, n_rows=nrows, infer_schema_length=None, encoding="utf8-lossy")
-    return read_csv(path, nrows=nrows)
-
-
-def frame_len(frame: pd.DataFrame | pl.DataFrame) -> int:
+def frame_len(frame: pl.DataFrame) -> int:
     return len(frame)
-
-
-def frame_columns(frame: pd.DataFrame | pl.DataFrame) -> list[str]:
-    return list(frame.columns)
 
 
 def polars_to_pandas(frame: pl.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(frame.to_dict(as_series=False))
-
-
-def first_non_null(series: pd.Series):
-    non_null = series.dropna()
-    if non_null.empty:
-        return np.nan
-    return non_null.iloc[0]
-
-
-def mode_or_missing(series: pd.Series):
-    non_null = series.dropna()
-    if non_null.empty:
-        return "__MISSING__"
-    mode = non_null.mode(dropna=True)
-    if mode.empty:
-        return str(non_null.iloc[0])
-    return str(mode.iloc[0])
-
-
-def nunique_non_null(series: pd.Series) -> int:
-    return int(series.nunique(dropna=True))
 
 
 def safe_divide(numerator: pd.Series, denominator: pd.Series) -> pd.Series:
@@ -223,18 +186,6 @@ def pl_nunique_non_null(column: str, alias: str) -> pl.Expr:
     return pl.col(column).drop_nulls().n_unique().cast(pl.Int32).alias(alias)
 
 
-def assert_contract_targets_are_constant(df: pd.DataFrame) -> None:
-    present = [col for col in ["premium", "premium_wo_term", "claim_amount", "claim_cnt", "is_claim"] if col in df]
-    inconsistent = {}
-    grouped = df.groupby("contract_number", sort=False)
-    for col in present:
-        n_bad = int((grouped[col].nunique(dropna=False) > 1).sum())
-        if n_bad:
-            inconsistent[col] = n_bad
-    if inconsistent:
-        raise ValueError(f"Contract-level fields vary within contract_number: {inconsistent}")
-
-
 def assert_contract_targets_are_constant_polars(df: pl.DataFrame) -> None:
     present = [col for col in ["premium", "premium_wo_term", "claim_amount", "claim_cnt", "is_claim"] if col in df.columns]
     if not present:
@@ -249,144 +200,42 @@ def assert_contract_targets_are_constant_polars(df: pl.DataFrame) -> None:
         raise ValueError(f"Contract-level fields vary within contract_number: {inconsistent}")
 
 
-def add_date_features(frame: pd.DataFrame, raw: pd.DataFrame) -> None:
-    if "operation_date" not in raw:
+def add_date_features(frame: pd.DataFrame, raw: pl.DataFrame) -> None:
+    if "operation_date" not in raw.columns:
         return
-    operation_date = raw.groupby("contract_number", sort=False)["operation_date"].agg(first_non_null)
-    dates = pd.to_datetime(operation_date, errors="coerce")
-    frame["operation_month"] = dates.dt.month
-    frame["operation_quarter"] = dates.dt.quarter
-    frame["operation_dayofweek"] = dates.dt.dayofweek
-
-
-def add_special_features(frame: pd.DataFrame, raw: pd.DataFrame) -> None:
-    grouped = raw.groupby("contract_number", sort=False)
-    frame["n_rows"] = grouped.size().astype("int32")
-
-    if "driver_iin" in raw:
-        frame["n_drivers"] = grouped["driver_iin"].nunique(dropna=True).astype("int32")
-    if "insurer_iin" in raw:
-        frame["n_insurers"] = grouped["insurer_iin"].nunique(dropna=True).astype("int32")
-    if {"insurer_iin", "driver_iin"}.issubset(raw.columns):
-        same_person = raw["insurer_iin"].fillna("") == raw["driver_iin"].fillna("__driver_missing__")
-        frame["insurer_is_driver_any"] = same_person.groupby(raw["contract_number"], sort=False).max().astype("int8")
-        frame["insurer_is_driver_all"] = same_person.groupby(raw["contract_number"], sort=False).min().astype("int8")
-    if "car_number" in raw:
-        frame["n_cars"] = grouped["car_number"].nunique(dropna=True).astype("int32")
-    if "region_id" in raw:
-        frame["n_regions"] = grouped["region_id"].nunique(dropna=True).astype("int32")
-
-    for source, target in [
-        ("n_drivers", "is_multi_driver"),
-        ("n_cars", "is_multi_car"),
-        ("n_regions", "is_multi_region"),
-    ]:
-        if source in frame:
-            frame[target] = (frame[source] > 1).astype("int8")
-
-
-def build_polars_score_features(raw_pl: pl.DataFrame, index: pd.Index) -> pd.DataFrame:
-    if "contract_number" not in raw_pl.columns:
-        return pd.DataFrame(index=index)
-
-    score_cols = [col for col in raw_pl.columns if col.startswith("SCORE_")]
-    if not score_cols:
-        return pd.DataFrame(index=index)
-
-    score_exprs = [pl.col(col).cast(pl.Float64, strict=False) for col in score_cols]
-    available_exprs = [pl.col(col).cast(pl.Float64, strict=False).is_not_null().cast(pl.Int32) for col in score_cols]
-    missing_exprs = [pl.col(col).cast(pl.Float64, strict=False).is_null().cast(pl.Int32) for col in score_cols]
-    score_available = pl.sum_horizontal(available_exprs)
-    score_sum = pl.sum_horizontal([expr.fill_null(0.0) for expr in score_exprs])
-    score_sum_sq = pl.sum_horizontal([(expr * expr).fill_null(0.0) for expr in score_exprs])
-    score_row_std = (
-        pl.when(score_available > 1)
-        .then(((score_sum_sq - (score_sum * score_sum / score_available)) / (score_available - 1)).clip(0.0).sqrt())
-        .otherwise(None)
+    date_features = raw.group_by("contract_number", maintain_order=True).agg(
+        pl.col("operation_date").drop_nulls().first().str.to_date(strict=False).alias("_operation_date")
+    ).select(
+        [
+            "contract_number",
+            pl.col("_operation_date").dt.month().alias("operation_month"),
+            pl.col("_operation_date").dt.quarter().alias("operation_quarter"),
+            pl.col("_operation_date").dt.weekday().sub(1).alias("operation_dayofweek"),
+        ]
     )
-
-    grouped_columns: dict[str, list[str]] = {}
-    for col in score_cols:
-        group = score_group(col)
-        if group is not None:
-            grouped_columns.setdefault(group, []).append(col)
-
-    group_row_columns: list[pl.Expr] = []
-    group_agg_exprs: list[pl.Expr] = []
-    for group, cols in sorted(grouped_columns.items(), key=lambda item: int(item[0])):
-        group_exprs = [pl.col(col).cast(pl.Float64, strict=False) for col in cols]
-        prefix = f"score_g{group}"
-        group_row_columns.extend(
-            [
-                pl.mean_horizontal(group_exprs).alias(f"_{prefix}_mean"),
-                pl.mean_horizontal([expr.is_null().cast(pl.Int32) for expr in group_exprs]).alias(
-                    f"_{prefix}_missing_rate"
-                ),
-            ]
-        )
-        group_agg_exprs.extend(
-            [
-                pl.col(f"_{prefix}_mean").mean().alias(f"{prefix}_mean_mean"),
-                pl.col(f"_{prefix}_mean").min().alias(f"{prefix}_mean_min"),
-                pl.col(f"_{prefix}_mean").max().alias(f"{prefix}_mean_max"),
-                pl.col(f"_{prefix}_mean").std().alias(f"{prefix}_mean_std"),
-                pl.col(f"_{prefix}_missing_rate").mean().alias(f"{prefix}_missing_rate_mean"),
-            ]
-        )
-
-    with_rows = raw_pl.select(
-        "contract_number",
-        score_available.alias("_score_available_count"),
-        pl.mean_horizontal(missing_exprs).alias("_score_missing_rate"),
-        pl.mean_horizontal(score_exprs).alias("_score_row_mean"),
-        pl.min_horizontal(score_exprs).alias("_score_row_min"),
-        pl.max_horizontal(score_exprs).alias("_score_row_max"),
-        score_row_std.alias("_score_row_std"),
-        *group_row_columns,
-    )
-
-    agg_exprs = [
-        pl.col("_score_available_count").mean().alias("score_available_count_mean"),
-        pl.col("_score_available_count").min().cast(pl.Int32).alias("score_available_count_min"),
-        pl.col("_score_missing_rate").mean().alias("score_missing_rate_mean"),
-        pl.col("_score_missing_rate").max().alias("score_missing_rate_max"),
-        pl.col("_score_row_mean").mean().alias("score_row_mean_mean"),
-        pl.col("_score_row_mean").min().alias("score_row_mean_min"),
-        pl.col("_score_row_mean").max().alias("score_row_mean_max"),
-        pl.col("_score_row_mean").std().alias("score_row_mean_std"),
-        pl.col("_score_row_min").mean().alias("score_row_min_mean"),
-        pl.col("_score_row_min").min().alias("score_row_min_min"),
-        pl.col("_score_row_max").mean().alias("score_row_max_mean"),
-        pl.col("_score_row_max").max().alias("score_row_max_max"),
-        pl.col("_score_row_std").mean().alias("score_row_std_mean"),
-        pl.col("_score_row_std").max().alias("score_row_std_max"),
-        *group_agg_exprs,
-    ]
-
-    features = polars_to_pandas(with_rows.group_by("contract_number", maintain_order=True).agg(agg_exprs))
-    features = features.set_index("contract_number").reindex(index).replace([np.inf, -np.inf], np.nan)
-    return features
+    indexed = polars_to_pandas(date_features).set_index("contract_number").reindex(frame.index)
+    for col in indexed.columns:
+        frame[col] = indexed[col]
 
 
-def build_contract_frame_polars(raw: pd.DataFrame | pl.DataFrame, is_train: bool) -> pd.DataFrame:
-    if "contract_number" not in frame_columns(raw):
+def build_contract_frame(raw: pl.DataFrame, is_train: bool) -> pd.DataFrame:
+    if "contract_number" not in raw.columns:
         raise ValueError("Input data must contain contract_number.")
-    raw_pl = raw if isinstance(raw, pl.DataFrame) else pl.from_dict(raw.to_dict("list"))
     if is_train:
-        assert_contract_targets_are_constant_polars(raw_pl)
+        assert_contract_targets_are_constant_polars(raw)
 
     metric_columns = ["premium", "premium_wo_term", "claim_amount", "claim_cnt", "is_claim"]
-    base_exprs = [pl_first_non_null(col) for col in metric_columns if col in raw_pl.columns]
+    base_exprs = [pl_first_non_null(col) for col in metric_columns if col in raw.columns]
     special_exprs: list[pl.Expr] = [pl.len().cast(pl.Int32).alias("n_rows")]
-    if "driver_iin" in raw_pl.columns:
+    if "driver_iin" in raw.columns:
         special_exprs.append(pl_nunique_non_null("driver_iin", "n_drivers"))
-    if "insurer_iin" in raw_pl.columns:
+    if "insurer_iin" in raw.columns:
         special_exprs.append(pl_nunique_non_null("insurer_iin", "n_insurers"))
-    if "car_number" in raw_pl.columns:
+    if "car_number" in raw.columns:
         special_exprs.append(pl_nunique_non_null("car_number", "n_cars"))
-    if "region_id" in raw_pl.columns:
+    if "region_id" in raw.columns:
         special_exprs.append(pl_nunique_non_null("region_id", "n_regions"))
-    if {"insurer_iin", "driver_iin"}.issubset(raw_pl.columns):
+    if {"insurer_iin", "driver_iin"}.issubset(raw.columns):
         same_person = pl.col("insurer_iin").fill_null("") == pl.col("driver_iin").fill_null("__driver_missing__")
         special_exprs.extend(
             [
@@ -395,7 +244,7 @@ def build_contract_frame_polars(raw: pd.DataFrame | pl.DataFrame, is_train: bool
             ]
         )
 
-    grouped = raw_pl.group_by("contract_number", maintain_order=True).agg([*base_exprs, *special_exprs])
+    grouped = raw.group_by("contract_number", maintain_order=True).agg([*base_exprs, *special_exprs])
     frame = polars_to_pandas(grouped).set_index("contract_number")
 
     for source, target in [
@@ -406,38 +255,24 @@ def build_contract_frame_polars(raw: pd.DataFrame | pl.DataFrame, is_train: bool
         if source in frame:
             frame[target] = (frame[source] > 1).astype("int8")
 
-    pandas_needed = [
-        col
-        for col in [
-            "contract_number",
-            "region_name",
-            "mark",
-            "model",
-            "car_year",
-            "car_age",
-            "operation_date",
-        ]
-        if col in raw_pl.columns
-    ]
-    raw_for_local_features = polars_to_pandas(raw_pl.select(pandas_needed))
-    add_region_features(raw_for_local_features, frame)
-    add_model_mark_features(raw_for_local_features, frame)
-    add_car_features(raw_for_local_features, frame)
-    score_features = build_polars_score_features(raw_pl, frame.index)
+    add_region_features(raw, frame)
+    add_model_mark_features(raw, frame)
+    add_car_features(raw, frame)
+    score_features = build_score_features(raw, frame.index)
     if not score_features.empty:
         frame = pd.concat([frame, score_features], axis=1).copy()
     add_premium_features(frame)
-    add_date_features(frame, raw_for_local_features)
+    add_date_features(frame, raw)
 
     excluded = LEAKAGE_COLUMNS | DATE_COLUMNS | PREPROCESSED_SOURCE_COLUMNS
-    candidate_columns = [col for col in raw_pl.columns if col not in excluded and not col.startswith("SCORE_")]
+    candidate_columns = [col for col in raw.columns if col not in excluded and not col.startswith("SCORE_")]
     numeric_columns = [
         col
         for col in candidate_columns
-        if raw_pl.schema[col].is_numeric() and col not in {"ownerkato", "ownerkato_short"}
+        if raw.schema[col].is_numeric() and col not in {"ownerkato", "ownerkato_short"}
     ]
     categorical_columns = [col for col in candidate_columns if col not in numeric_columns]
-    categorical_columns.extend([col for col in ["ownerkato", "ownerkato_short"] if col in raw])
+    categorical_columns.extend([col for col in ["ownerkato", "ownerkato_short"] if col in raw.columns])
     categorical_columns = list(dict.fromkeys(categorical_columns))
 
     agg_exprs: list[pl.Expr] = []
@@ -461,77 +296,9 @@ def build_contract_frame_polars(raw: pd.DataFrame | pl.DataFrame, is_train: bool
         )
 
     if agg_exprs:
-        generic_features = polars_to_pandas(raw_pl.group_by("contract_number", maintain_order=True).agg(agg_exprs))
+        generic_features = polars_to_pandas(raw.group_by("contract_number", maintain_order=True).agg(agg_exprs))
         generic_features = generic_features.set_index("contract_number").reindex(frame.index)
         frame = pd.concat([frame, generic_features], axis=1).copy()
-
-    if "claim_amount" in frame:
-        frame["claim_amount"] = frame["claim_amount"].fillna(0.0)
-    if "claim_cnt" in frame:
-        frame["claim_cnt"] = frame["claim_cnt"].fillna(0.0)
-    if "is_claim" in frame:
-        frame["is_claim"] = frame["is_claim"].fillna(0).astype("int8")
-    if {"claim_amount", "premium_wo_term"}.issubset(frame.columns):
-        frame["loss_ratio"] = safe_divide(frame["claim_amount"], frame["premium_wo_term"]).fillna(0.0)
-
-    return frame.copy().reset_index()
-
-
-def build_contract_frame(raw: pd.DataFrame, is_train: bool) -> pd.DataFrame:
-    if "contract_number" not in raw:
-        raise ValueError("Input data must contain contract_number.")
-    if is_train:
-        assert_contract_targets_are_constant(raw)
-
-    grouped = raw.groupby("contract_number", sort=False)
-    frame = pd.DataFrame(index=grouped.size().index)
-    frame.index.name = "contract_number"
-
-    base_columns: list[pd.Series] = []
-    metric_columns = ["premium", "premium_wo_term", "claim_amount", "claim_cnt", "is_claim"]
-    for col in metric_columns:
-        if col in raw:
-            base_columns.append(grouped[col].agg(first_non_null).rename(col))
-    if base_columns:
-        frame = pd.concat([frame, *base_columns], axis=1)
-
-    add_special_features(frame, raw)
-    add_region_features(raw, frame)
-    add_model_mark_features(raw, frame)
-    add_car_features(raw, frame)
-    score_features = build_score_features(raw, frame.index)
-    if not score_features.empty:
-        frame = pd.concat([frame, score_features], axis=1).copy()
-    add_premium_features(frame)
-    add_date_features(frame, raw)
-
-    excluded = LEAKAGE_COLUMNS | DATE_COLUMNS | PREPROCESSED_SOURCE_COLUMNS
-    candidate_columns = [col for col in raw.columns if col not in excluded and not col.startswith("SCORE_")]
-    numeric_columns = [
-        col
-        for col in candidate_columns
-        if pd.api.types.is_numeric_dtype(raw[col]) and col not in {"ownerkato", "ownerkato_short"}
-    ]
-    categorical_columns = [col for col in candidate_columns if col not in numeric_columns]
-    categorical_columns.extend([col for col in ["ownerkato", "ownerkato_short"] if col in raw])
-    categorical_columns = list(dict.fromkeys(categorical_columns))
-
-    feature_blocks: list[pd.DataFrame] = []
-    for col in numeric_columns:
-        values = grouped[col].agg(["min", "max", "mean", "std"])
-        values.columns = [f"{col}_{suffix}" for suffix in values.columns]
-        nunique = grouped[col].nunique(dropna=True).astype("int32").rename(f"{col}_nunique")
-        feature_blocks.append(pd.concat([values, nunique], axis=1))
-
-    categorical_features: list[pd.Series] = []
-    for col in categorical_columns:
-        categorical_features.append(grouped[col].agg(mode_or_missing).rename(f"{col}_mode"))
-        categorical_features.append(grouped[col].agg(nunique_non_null).astype("int32").rename(f"{col}_nunique"))
-
-    if categorical_features:
-        feature_blocks.append(pd.concat(categorical_features, axis=1))
-    if feature_blocks:
-        frame = pd.concat([frame, *feature_blocks], axis=1).copy()
 
     if "claim_amount" in frame:
         frame["claim_amount"] = frame["claim_amount"].fillna(0.0)
@@ -941,30 +708,28 @@ def main() -> None:
     submission_path.parent.mkdir(parents=True, exist_ok=True)
 
     started_at = log_stage(1, f"read train/test CSV ({args.train}, {args.test})", enabled=show_progress)
-    raw_train = read_input(args.train, args.train_rows, args.aggregation_backend)
-    raw_test = read_input(args.test, args.test_rows, args.aggregation_backend)
+    raw_train = read_input(args.train, args.train_rows)
+    raw_test = read_input(args.test, args.test_rows)
     log_stage_done(
         started_at,
         f"loaded {frame_len(raw_train):,} train rows and {frame_len(raw_test):,} test rows",
         enabled=show_progress,
     )
 
-    contract_builder = build_contract_frame_polars if args.aggregation_backend == "polars" else build_contract_frame
-
     started_at = log_stage(
         2,
-        f"aggregate train rows to contract level and build features ({args.aggregation_backend})",
+        "aggregate train rows to contract level and build features (polars)",
         enabled=show_progress,
     )
-    train_contracts = contract_builder(raw_train, is_train=True)
+    train_contracts = build_contract_frame(raw_train, is_train=True)
     log_stage_done(started_at, f"built {len(train_contracts):,} train contracts", enabled=show_progress)
 
     started_at = log_stage(
         3,
-        f"aggregate test rows to contract level and build features ({args.aggregation_backend})",
+        "aggregate test rows to contract level and build features (polars)",
         enabled=show_progress,
     )
-    test_contracts = contract_builder(raw_test, is_train=False)
+    test_contracts = build_contract_frame(raw_test, is_train=False)
     log_stage_done(started_at, f"built {len(test_contracts):,} test contracts", enabled=show_progress)
 
     started_at = log_stage(4, "split train/validation contracts", enabled=show_progress)

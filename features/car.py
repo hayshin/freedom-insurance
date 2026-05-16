@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
+import polars as pl
 
 
 REFERENCE_YEAR = 2022
@@ -20,30 +21,46 @@ def parse_is_seven_year_car(value: object) -> float:
     return np.nan
 
 
-def add_car_features(raw: pd.DataFrame, frame: pd.DataFrame) -> None:
+def _to_indexed_pandas(features: pl.DataFrame, index: pd.Index) -> pd.DataFrame:
+    if features.is_empty():
+        return pd.DataFrame(index=index)
+    return pd.DataFrame(features.to_dict(as_series=False)).set_index("contract_number").reindex(index)
+
+
+def add_car_features(raw: pl.DataFrame, frame: pd.DataFrame) -> None:
     required = {"contract_number", "car_year"}
     if not required.issubset(raw.columns):
         return
 
-    car = raw[["contract_number", "car_year"]].copy()
-    car_year = pd.to_numeric(car["car_year"], errors="coerce")
-    car["car_age_years"] = (REFERENCE_YEAR - car_year).where(car_year.between(1900, REFERENCE_YEAR))
-    car["is_seven_year_car"] = car["car_age_years"].le(7).where(car["car_age_years"].notna())
+    car_year = pl.col("car_year").cast(pl.Float64, strict=False)
+    age = pl.when(car_year.is_between(1900, REFERENCE_YEAR)).then(REFERENCE_YEAR - car_year).otherwise(None)
+    is_seven = pl.when(age.is_not_null()).then(age <= 7).otherwise(None)
 
-    if "car_age" in raw:
-        fallback = raw["car_age"].map(parse_is_seven_year_car)
-        car["is_seven_year_car"] = car["is_seven_year_car"].fillna(fallback)
+    expressions = [pl.col("contract_number"), age.alias("car_age_years"), is_seven.cast(pl.Float64).alias("is_seven_year_car")]
+    if "car_age" in raw.columns:
+        normalized_age = pl.col("car_age").cast(pl.String, strict=False).str.to_lowercase()
+        fallback = (
+            pl.when(normalized_age.str.contains("до 7|меньше 7", literal=False))
+            .then(1.0)
+            .when(normalized_age.str.contains("свыше 7|больше 7", literal=False))
+            .then(0.0)
+            .otherwise(None)
+        )
+        expressions[-1] = pl.coalesce(is_seven.cast(pl.Float64), fallback).alias("is_seven_year_car")
 
-    grouped = car.groupby("contract_number", sort=False)
-    car_age = grouped["car_age_years"].agg(["min", "max", "mean", "std"])
-    car_age.columns = [f"car_age_{suffix}" for suffix in car_age.columns]
-    frame["car_age"] = car_age["car_age_mean"]
-    frame["car_age_min"] = car_age["car_age_min"]
-    frame["car_age_max"] = car_age["car_age_max"]
-    frame["car_age_std"] = car_age["car_age_std"]
-    frame["car_age_nunique"] = grouped["car_age_years"].nunique(dropna=True).astype("int32")
-
-    seven_year = grouped["is_seven_year_car"].agg(["max", "min", "mean"])
-    frame["is_seven_year_car"] = seven_year["max"].fillna(0).astype("int8")
-    frame["is_all_seven_year_car"] = seven_year["min"].fillna(0).astype("int8")
-    frame["seven_year_car_share"] = seven_year["mean"].fillna(0.0)
+    car = raw.select(expressions)
+    features = car.group_by("contract_number", maintain_order=True).agg(
+        [
+            pl.col("car_age_years").mean().alias("car_age"),
+            pl.col("car_age_years").min().alias("car_age_min"),
+            pl.col("car_age_years").max().alias("car_age_max"),
+            pl.col("car_age_years").std().alias("car_age_std"),
+            pl.col("car_age_years").drop_nulls().n_unique().cast(pl.Int32).alias("car_age_nunique"),
+            pl.col("is_seven_year_car").max().fill_null(0).cast(pl.Int8).alias("is_seven_year_car"),
+            pl.col("is_seven_year_car").min().fill_null(0).cast(pl.Int8).alias("is_all_seven_year_car"),
+            pl.col("is_seven_year_car").mean().fill_null(0.0).alias("seven_year_car_share"),
+        ]
+    )
+    indexed = _to_indexed_pandas(features, frame.index)
+    for col in indexed.columns:
+        frame[col] = indexed[col]
