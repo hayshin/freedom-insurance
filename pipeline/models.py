@@ -132,7 +132,13 @@ def make_lgbm_regressor(random_state: int):
     )
 
 
-def make_catboost_classifier(random_state: int, progress_period: int, show_progress: bool):
+def make_catboost_classifier(
+    random_state: int,
+    progress_period: int,
+    show_progress: bool,
+    *,
+    use_best_model: bool = True,
+):
     return CatBoostClassifier(
         loss_function="Logloss",
         eval_metric="AUC",
@@ -145,7 +151,7 @@ def make_catboost_classifier(random_state: int, progress_period: int, show_progr
         random_strength=0.5,
         od_type="Iter",
         od_wait=80,
-        use_best_model=True,
+        use_best_model=use_best_model,
         allow_writing_files=False,
         thread_count=-1,
         verbose=max(1, progress_period) if show_progress else False,
@@ -482,6 +488,52 @@ def train_frequency_model(
     model.fit(train_x, train_y)
     valid_pred = model.predict_proba(valid_x)[:, 1]
     return model, valid_pred, "sklearn_hist_gradient_boosting"
+
+
+def train_frequency_final_model(
+    train_x: pd.DataFrame,
+    train_y: pd.Series,
+    categorical: list[str],
+    numeric: list[str],
+    random_state: int,
+    backend: str,
+    progress_period: int,
+    show_progress: bool,
+):
+    if backend == "catboost":
+        model = make_catboost_classifier(
+            random_state,
+            progress_period,
+            show_progress,
+            use_best_model=False,
+        )
+        model.fit(
+            prepare_catboost_frame(train_x, categorical),
+            train_y,
+            cat_features=categorical,
+        )
+        return model, "catboost"
+
+    if backend == "lightgbm":
+        model = make_lgbm_classifier(random_state)
+        model.fit(
+            prepare_lgbm_frame(train_x, categorical),
+            train_y,
+            categorical_feature=categorical,
+            callbacks=[
+                make_lgbm_progress_callback(
+                    "Final frequency model",
+                    total_iterations=model.n_estimators,
+                    period=progress_period,
+                    enabled=show_progress,
+                )
+            ],
+        )
+        return model, "lightgbm"
+
+    model = make_sklearn_model("classifier", numeric, categorical, random_state)
+    model.fit(train_x, train_y)
+    return model, "sklearn_hist_gradient_boosting"
 
 
 def train_severity_model(

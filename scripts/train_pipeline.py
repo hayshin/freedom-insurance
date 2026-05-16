@@ -23,6 +23,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--test-rows", type=int, default=None, help="Read only the first N test rows for smoke tests.")
     parser.add_argument("--random-state", type=int, default=42)
     parser.add_argument("--valid-size", type=float, default=0.2)
+    parser.add_argument(
+        "--final-mode",
+        choices=["legacy", "evaluation", "production", "both"],
+        default="both",
+        help=(
+            "legacy keeps the old single validation flow; evaluation reports untouched holdout metrics; "
+            "production builds final OOF-calibrated submission; both does evaluation and production."
+        ),
+    )
+    parser.add_argument(
+        "--production-splits",
+        type=int,
+        default=5,
+        help="Number of stratified folds for production OOF calibration.",
+    )
+    parser.add_argument(
+        "--compare-risk-encoding",
+        action="store_true",
+        help="Evaluate baseline and non-ID OOF risk encoding, then use the better holdout config for production.",
+    )
     parser.add_argument("--rare-min-count", type=int, default=50)
     parser.add_argument("--severity-min-claims", type=int, default=50)
     parser.add_argument(

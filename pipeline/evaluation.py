@@ -39,9 +39,13 @@ def evaluate(
     positive = actual_claim > 0
     base_premium = valid["premium"].astype(float).to_numpy()
     increased = new_premium > base_premium
+    decreased = new_premium < base_premium
+    kept = new_premium == base_premium
     keep_or_decrease = ~increased
     keep_or_decrease_count = int(keep_or_decrease.sum())
     increase_count = int(increased.sum())
+    decrease_count = int(decreased.sum())
+    keep_count = int(kept.sum())
     keep_lr = (
         portfolio_loss_ratio(
             actual_claim[keep_or_decrease],
@@ -85,15 +89,24 @@ def evaluate(
             "post_pricing_loss_ratio": portfolio_loss_ratio(actual_claim, new_premium),
             "mean_expected_claim": float(np.mean(expected_claim)),
             "mean_new_premium": float(np.mean(new_premium)),
-            "increase_share": float((new_premium > valid["premium"].to_numpy()).mean()),
-            "keep_or_decrease_share": float((new_premium <= valid["premium"].to_numpy()).mean()),
+            "increase_share": float(increased.mean()),
+            "keep_share": float(kept.mean()),
+            "decrease_share": float(decreased.mean()),
+            "keep_or_decrease_share": float(keep_or_decrease.mean()),
             "keep_or_decrease_count": keep_or_decrease_count,
             "increase_count": increase_count,
+            "keep_count": keep_count,
+            "decrease_count": decrease_count,
             "keep_or_decrease_loss_ratio": keep_lr,
             "increase_loss_ratio": increase_lr,
             "group_loss_ratio_gap": group_loss_ratio_gap,
             "min_new_to_old_premium_ratio": float(np.min(new_premium / np.maximum(base_premium, 1.0))),
             "max_new_to_old_premium_ratio": float(np.max(new_premium / np.maximum(base_premium, 1.0))),
+            "mean_uplift_for_increased": (
+                float(np.mean((new_premium[increased] / np.maximum(base_premium[increased], 1.0)) - 1.0))
+                if increased.any()
+                else None
+            ),
         },
     }
     if positive.any():
