@@ -33,6 +33,10 @@ HIGH_CARDINALITY_COLUMNS = {
     "ownerkato",
     "ownerkato_short",
 }
+OUTLIER_CAP_COLUMNS = {
+    "engine_volume",
+    "engine_power",
+}
 TARGET_LOSS_RATIO = 0.70
 N_PIPELINE_STAGES = 12
 

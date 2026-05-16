@@ -16,7 +16,11 @@ def _clean_positive(column: str) -> pl.Expr:
     return pl.when(values > 0).then(values).otherwise(None)
 
 
-def add_engine_features(raw: pl.DataFrame, frame: pd.DataFrame) -> None:
+def add_engine_features(
+    raw: pl.DataFrame,
+    frame: pd.DataFrame,
+    outlier_caps: dict[str, tuple[float, float]] | None = None,
+) -> None:
     if "contract_number" not in raw.columns:
         return
 
@@ -27,6 +31,9 @@ def add_engine_features(raw: pl.DataFrame, frame: pd.DataFrame) -> None:
     volume = _clean_positive("engine_volume") if "engine_volume" in raw.columns else pl.lit(None, dtype=pl.Float64)
     power = _clean_positive("engine_power") if "engine_power" in raw.columns else pl.lit(None, dtype=pl.Float64)
     ratio = pl.when(volume.is_not_null() & power.is_not_null()).then(power / volume).otherwise(None)
+    if outlier_caps and "engine_power_per_volume" in outlier_caps:
+        lower, upper = outlier_caps["engine_power_per_volume"]
+        ratio = ratio.clip(lower, upper)
 
     rows = raw.select(
         [

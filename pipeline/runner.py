@@ -19,6 +19,8 @@ from pipeline.models import (
     train_frequency_model,
     train_severity_model,
 )
+from pipeline.config import OUTLIER_CAP_COLUMNS
+from pipeline.outliers import compute_engine_ratio_caps, compute_outlier_caps
 from pipeline.pricing import apply_pricing, calibrate_pricing
 
 
@@ -39,12 +41,15 @@ def run_pipeline(args) -> None:
         enabled=show_progress,
     )
 
+    outlier_caps = compute_outlier_caps(raw_train, OUTLIER_CAP_COLUMNS)
+    outlier_caps.update(compute_engine_ratio_caps(raw_train))
+
     started_at = log_stage(
         2,
         "aggregate train rows to contract level and build features (polars)",
         enabled=show_progress,
     )
-    train_contracts = build_contract_frame(raw_train, is_train=True)
+    train_contracts = build_contract_frame(raw_train, is_train=True, outlier_caps=outlier_caps)
     log_stage_done(started_at, f"built {len(train_contracts):,} train contracts", enabled=show_progress)
 
     started_at = log_stage(
@@ -52,7 +57,7 @@ def run_pipeline(args) -> None:
         "aggregate test rows to contract level and build features (polars)",
         enabled=show_progress,
     )
-    test_contracts = build_contract_frame(raw_test, is_train=False)
+    test_contracts = build_contract_frame(raw_test, is_train=False, outlier_caps=outlier_caps)
     log_stage_done(started_at, f"built {len(test_contracts):,} test contracts", enabled=show_progress)
 
     started_at = log_stage(4, "split train/validation contracts", enabled=show_progress)
@@ -206,6 +211,7 @@ def run_pipeline(args) -> None:
             "category_vocab": category_vocab,
             "pricing_calibration": calibration,
             "rare_min_count": args.rare_min_count,
+            "outlier_caps": outlier_caps,
         },
     )
     metrics_text = json.dumps(metrics, ensure_ascii=False, indent=2)

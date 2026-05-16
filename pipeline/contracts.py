@@ -14,6 +14,7 @@ from features.score import build_score_features
 from features.vehicle_type import add_vehicle_type_features
 from pipeline.config import DATE_COLUMNS, LEAKAGE_COLUMNS, PREPROCESSED_SOURCE_COLUMNS
 from pipeline.io import polars_to_pandas
+from pipeline.outliers import apply_outlier_caps
 
 
 def safe_divide(numerator: pd.Series, denominator: pd.Series) -> pd.Series:
@@ -72,11 +73,17 @@ def add_date_features(frame: pd.DataFrame, raw: pl.DataFrame) -> None:
         frame[col] = indexed[col]
 
 
-def build_contract_frame(raw: pl.DataFrame, is_train: bool) -> pd.DataFrame:
+def build_contract_frame(
+    raw: pl.DataFrame,
+    is_train: bool,
+    outlier_caps: dict[str, tuple[float, float]] | None = None,
+) -> pd.DataFrame:
     if "contract_number" not in raw.columns:
         raise ValueError("Input data must contain contract_number.")
     if is_train:
         assert_contract_targets_are_constant_polars(raw)
+
+    raw = apply_outlier_caps(raw, outlier_caps)
 
     metric_columns = ["premium", "premium_wo_term", "claim_amount", "claim_cnt", "is_claim"]
     base_exprs = [pl_first_non_null(col) for col in metric_columns if col in raw.columns]
@@ -113,7 +120,7 @@ def build_contract_frame(raw: pl.DataFrame, is_train: bool) -> pd.DataFrame:
     add_model_mark_features(raw, frame)
     add_car_features(raw, frame)
     add_vehicle_type_features(raw, frame)
-    add_engine_features(raw, frame)
+    add_engine_features(raw, frame, outlier_caps)
     add_driver_features(raw, frame)
     score_features = build_score_features(raw, frame.index)
     if not score_features.empty:
