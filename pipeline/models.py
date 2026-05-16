@@ -136,12 +136,16 @@ def make_catboost_classifier(random_state: int, progress_period: int, show_progr
     return CatBoostClassifier(
         loss_function="Logloss",
         eval_metric="AUC",
-        iterations=900,
-        learning_rate=0.03,
-        depth=6,
-        l2_leaf_reg=6.0,
+        iterations=1400,
+        learning_rate=0.035,
+        depth=5,
+        l2_leaf_reg=10.0,
         random_seed=random_state,
         auto_class_weights="SqrtBalanced",
+        random_strength=0.5,
+        od_type="Iter",
+        od_wait=80,
+        use_best_model=True,
         allow_writing_files=False,
         thread_count=-1,
         verbose=max(1, progress_period) if show_progress else False,
@@ -437,6 +441,7 @@ def train_frequency_model(
     train_x: pd.DataFrame,
     train_y: pd.Series,
     valid_x: pd.DataFrame,
+    valid_y: pd.Series,
     categorical: list[str],
     numeric: list[str],
     random_state: int,
@@ -450,6 +455,7 @@ def train_frequency_model(
             prepare_catboost_frame(train_x, categorical),
             train_y,
             cat_features=categorical,
+            eval_set=(prepare_catboost_frame(valid_x, categorical), valid_y),
         )
         valid_pred = model.predict_proba(prepare_catboost_frame(valid_x, categorical))[:, 1]
         return model, valid_pred, "catboost"

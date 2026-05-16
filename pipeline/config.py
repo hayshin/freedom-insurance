@@ -4,6 +4,11 @@ from dataclasses import dataclass
 
 TARGET_COLUMNS = {"claim_amount", "claim_cnt", "is_claim"}
 RAW_ID_COLUMNS = {"unique_id", "contract_number", "insurer_iin", "driver_iin", "car_number"}
+ID_STAT_HELPER_COLUMNS = {
+    "insurer_iin_mode",
+    "driver_iin_mode",
+    "car_number_mode",
+}
 FINANCIAL_METRIC_ONLY_COLUMNS = {
     "premium_wo_term",
     "premium_wo_term_log1p",
@@ -25,7 +30,7 @@ PREPROCESSED_SOURCE_COLUMNS = {
     "engine_volume",
     "engine_power",
 }
-LEAKAGE_COLUMNS = TARGET_COLUMNS | RAW_ID_COLUMNS | FINANCIAL_METRIC_ONLY_COLUMNS
+LEAKAGE_COLUMNS = TARGET_COLUMNS | RAW_ID_COLUMNS | ID_STAT_HELPER_COLUMNS | FINANCIAL_METRIC_ONLY_COLUMNS
 HIGH_CARDINALITY_COLUMNS = {
     "mark_clean_mode",
     "model_clean_mode",

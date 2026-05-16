@@ -90,10 +90,13 @@ def build_contract_frame(
     special_exprs: list[pl.Expr] = [pl.len().cast(pl.Int32).alias("n_rows")]
     if "driver_iin" in raw.columns:
         special_exprs.append(pl_nunique_non_null("driver_iin", "n_drivers"))
+        special_exprs.append(pl_mode_or_missing("driver_iin", "driver_iin_mode"))
     if "insurer_iin" in raw.columns:
         special_exprs.append(pl_nunique_non_null("insurer_iin", "n_insurers"))
+        special_exprs.append(pl_mode_or_missing("insurer_iin", "insurer_iin_mode"))
     if "car_number" in raw.columns:
         special_exprs.append(pl_nunique_non_null("car_number", "n_cars"))
+        special_exprs.append(pl_mode_or_missing("car_number", "car_number_mode"))
     if "region_id" in raw.columns:
         special_exprs.append(pl_nunique_non_null("region_id", "n_regions"))
     if {"insurer_iin", "driver_iin"}.issubset(raw.columns):

@@ -23,6 +23,7 @@ from pipeline.models import (
 from pipeline.config import OUTLIER_CAP_COLUMNS
 from pipeline.outliers import compute_engine_ratio_caps, compute_outlier_caps
 from pipeline.pricing import apply_pricing, calibrate_pricing
+from pipeline.risk_encoding import add_oof_risk_encoding_features
 
 
 def run_pipeline(args) -> None:
@@ -63,6 +64,17 @@ def run_pipeline(args) -> None:
 
     started_at = log_stage(4, "split train/validation contracts", enabled=show_progress)
     train_part, valid_part = split_train_valid(train_contracts, args.valid_size, args.random_state)
+    risk_encoding_info = None
+    if args.enable_risk_encoding:
+        risk_encoding_info = add_oof_risk_encoding_features(
+            train_part,
+            valid_part,
+            test_contracts,
+            random_state=args.random_state,
+            n_splits=args.risk_encoding_splits,
+            smoothing=args.risk_encoding_smoothing,
+            include_id_columns=args.enable_id_risk_encoding,
+        )
     full_feature_columns, numeric_columns, categorical_columns = build_feature_lists(train_part)
     log_stage_done(
         started_at,
@@ -102,6 +114,7 @@ def run_pipeline(args) -> None:
         train_x,
         train_part["is_claim"],
         valid_x,
+        valid_part["is_claim"],
         categorical_columns,
         numeric_columns,
         args.random_state,
@@ -203,9 +216,20 @@ def run_pipeline(args) -> None:
         "n_categorical_features": int(len(categorical_columns)),
         "severity_target": args.severity_target,
         "severity_calibrated": not args.disable_severity_calibration,
+        "risk_encoding_enabled": args.enable_risk_encoding,
+        "id_risk_encoding_enabled": args.enable_id_risk_encoding,
+        "n_risk_encoding_features": 0 if risk_encoding_info is None else len(risk_encoding_info.encoded_columns),
     }
     if tuning_info is not None:
         metrics["severity_tuning"] = tuning_info
+    if risk_encoding_info is not None:
+        metrics["risk_encoding"] = {
+            "prior": risk_encoding_info.prior,
+            "smoothing": risk_encoding_info.smoothing,
+            "n_splits": risk_encoding_info.n_splits,
+            "n_features": len(risk_encoding_info.encoded_columns),
+            "features": risk_encoding_info.encoded_columns,
+        }
     metrics["pricing_calibration"] = asdict(calibration)
     log_stage_done(
         started_at,
@@ -244,6 +268,7 @@ def run_pipeline(args) -> None:
             "severity_backend": severity_backend,
             "severity_target": args.severity_target,
             "severity_calibrated": not args.disable_severity_calibration,
+            "risk_encoding": risk_encoding_info,
             "feature_columns": list(train_x.columns),
             "numeric_columns": numeric_columns,
             "categorical_columns": categorical_columns,

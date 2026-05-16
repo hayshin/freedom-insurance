@@ -71,6 +71,28 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Disable validation-fitted affine calibration of severity predictions.",
     )
+    parser.add_argument(
+        "--enable-risk-encoding",
+        action="store_true",
+        help="Enable leakage-safe OOF risk encoding features for frequency model.",
+    )
+    parser.add_argument(
+        "--enable-id-risk-encoding",
+        action="store_true",
+        help="Include driver/car/insurer ID history in OOF risk encoding. Use only for validation experiments.",
+    )
+    parser.add_argument(
+        "--risk-encoding-splits",
+        type=int,
+        default=5,
+        help="Number of folds for OOF risk encoding on the train split.",
+    )
+    parser.add_argument(
+        "--risk-encoding-smoothing",
+        type=float,
+        default=80.0,
+        help="Smoothing strength for claim-rate risk encoding.",
+    )
     parser.add_argument("--quiet", action="store_true", help="Disable progress messages.")
     parser.add_argument(
         "--model-backend",
